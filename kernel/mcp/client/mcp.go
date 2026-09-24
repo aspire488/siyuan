@@ -675,7 +675,11 @@ func mcpToolContextHandler(serverName, toolName string, timeout time.Duration,
 	structuredContentExpected bool) func(context.Context, map[string]any) (tools.CallToolResult, error) {
 	return func(ctx context.Context, args map[string]any) (tools.CallToolResult, error) {
 		result := callMCPToolOnce(func() (*mcp.CallToolResult, error) {
-			result, err := callMCPTool(ctx, serverName, toolName, timeout, args)
+			result, err := callMCPToolWithSessionRecovery(ctx, func() (*mcp.CallToolResult, error) {
+				return callMCPTool(ctx, serverName, toolName, timeout, args)
+			}, func() bool {
+				return reconnectMCPAndWait(ctx, serverName)
+			})
 			updateMCPRuntimeAfterToolCall(serverName, err)
 			return result, err
 		}, func(err error) {
@@ -830,6 +834,58 @@ func getMCPSession(serverName string) *mcp.ClientSession {
 		}
 	}
 	return nil
+}
+
+// callMCPToolWithSessionRecovery retries exactly once when the server reports a missing session.
+func callMCPToolWithSessionRecovery(ctx context.Context,
+	call func() (*mcp.CallToolResult, error), reconnect func() bool) (*mcp.CallToolResult, error) {
+	result, err := call()
+	if !errors.Is(err, mcp.ErrSessionMissing) || ctx.Err() != nil || !reconnect() {
+		return result, err
+	}
+	return call()
+}
+
+// reconnectMCPAndWait synchronously restores a missing Streamable HTTP session.
+func reconnectMCPAndWait(ctx context.Context, serverName string) bool {
+	mcpMu.Lock()
+	servers := append([]conf.MCPServer(nil), mcpServers...)
+	serverID := ""
+	for _, server := range servers {
+		if server.Name == serverName && server.Enabled {
+			serverID = server.ID
+			break
+		}
+	}
+	mcpMu.Unlock()
+	if serverID == "" {
+		return false
+	}
+
+	ReconnectMCPAsync(servers, []string{serverID}, nil)
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		mcpMu.Lock()
+		connected := false
+		for _, connection := range mcpConns {
+			if connection.ServerID == serverID && connection.Session != nil {
+				connected = true
+				break
+			}
+		}
+		connecting := mcpConnecting
+		mcpMu.Unlock()
+		if connected && !connecting {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // reconnectMCP 关闭现有连接并重新注册工具。

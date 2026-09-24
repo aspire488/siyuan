@@ -157,6 +157,50 @@ func TestEnvironmentVariableNames(t *testing.T) {
 	}
 }
 
+func TestCallMCPToolWithSessionRecoveryRetriesMissingSessionOnce(t *testing.T) {
+	calls := 0
+	reconnects := 0
+	result, err := callMCPToolWithSessionRecovery(t.Context(), func() (*mcp.CallToolResult, error) {
+		calls++
+		if calls == 1 {
+			return nil, mcp.ErrSessionMissing
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "recovered"}},
+		}, nil
+	}, func() bool {
+		reconnects++
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || reconnects != 1 {
+		t.Fatalf("unexpected recovery counts: calls=%d, reconnects=%d", calls, reconnects)
+	}
+	if len(result.Content) != 1 || result.Content[0].(*mcp.TextContent).Text != "recovered" {
+		t.Fatalf("unexpected recovered result: %#v", result)
+	}
+}
+
+func TestCallMCPToolWithSessionRecoveryDoesNotReplayAmbiguousDisconnect(t *testing.T) {
+	calls := 0
+	reconnects := 0
+	_, err := callMCPToolWithSessionRecovery(t.Context(), func() (*mcp.CallToolResult, error) {
+		calls++
+		return nil, errors.New("connection reset after request")
+	}, func() bool {
+		reconnects++
+		return true
+	})
+	if err == nil {
+		t.Fatal("expected disconnect error")
+	}
+	if calls != 1 || reconnects != 0 {
+		t.Fatalf("ambiguous disconnect was replayed: calls=%d reconnects=%d", calls, reconnects)
+	}
+}
+
 func TestCallMCPToolOnceMarksTimeoutUnknownWithoutReconnect(t *testing.T) {
 	calls := 0
 	reconnects := 0
